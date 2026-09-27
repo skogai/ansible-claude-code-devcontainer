@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# run <config> — one experiment: base devcontainer + CONTEXT.md + .skogai/config/claude/<config>/run.sh
+# Result lands in tmp/runs/<time>-<config>/ (status, logs, reply, token counts). Never prompts.
+set -uo pipefail
+
+config="${1:-base}"
+repo="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+base="$repo/src/claude-code-ansible/.devcontainer"
+script="$repo/.skogai/config/claude/$config/run.sh"
+ws="$repo/tmp/workspace"
+out="$repo/tmp/runs/$(date +%Y%m%dT%H%M%S)-$config"
+
+export DOCKER_HOST=unix:///run/user/1000/podman/podman.sock
+dc=(npx -y @devcontainers/cli)
+
+[[ -f "$script" ]] || { echo "no config: $script" >&2; exit 2; }
+mkdir -p "$out" "$ws"
+
+finish() { # finish <status> — record outcome and stop
+  echo "$1" >"$out/status"
+  jq -n --arg config "$config" --arg status "$1" --arg ws "$ws" \
+    --slurpfile r <(jq -c . "$out/reply.json" 2>/dev/null || echo null) '
+    {config: $config, status: $status,
+     is_error: $r[0].is_error, model: ($r[0].modelUsage // {} | keys),
+     usage: $r[0].usage, total_cost_usd: $r[0].total_cost_usd,
+     duration_ms: $r[0].duration_ms, num_turns: $r[0].num_turns}' >"$out/summary.json"
+  jq -r '.result // empty' "$out/reply.json" >"$out/reply.md" 2>/dev/null
+  echo "$out: $1"
+  exit 0
+}
+
+# 1. unchanged base into the fixed workspace (fixed path = same devcontainerId = same login volume)
+rm -rf "$ws/.devcontainer"
+cp -r "$base" "$ws/.devcontainer"
+cp "$script" "$ws/.skogai-run.sh"
+cp -r "$repo/.skogai/config/claude/$config" "$out/config"
+
+# 2. CONTEXT.md: text, staged diff, text
+{
+  printf '[$skogai:context]\n'
+  git -C "$repo" diff --cached
+  printf '[$/skogai:context]\n'
+} >"$ws/CONTEXT.md"
+cp "$ws/CONTEXT.md" "$out/CONTEXT.md"
+
+# 3. up. Rootless podman race: the CLI's `podman events --filter event=start` can miss the start
+# event and hang forever after "Container started". Watchdog: if the log is silent for 60s after
+# that line, kill and re-run `up` once; the second `up` finds the running container and goes on.
+up() { # up <attempt>
+  "${dc[@]}" up --workspace-folder "$ws" --docker-path podman >"$out/up.json" 2>>"$out/up.log" &
+  local pid=$! last=0 size
+  quiet=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5
+    size=$(stat -c %s "$out/up.log")
+    if [[ "$size" != "$last" ]]; then last=$size quiet=0; else quiet=$((quiet + 5)); fi
+    if ((quiet >= 60)) && [[ "$(tail -n1 "$out/up.log")" == *"Container started"* ]]; then
+      echo "attempt $1: hung after 'Container started', retrying" >>"$out/up.retries"
+      pkill -P "$pid"; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      return 1
+    fi
+  done
+  wait "$pid"
+}
+start=$(date +%s)
+up 1 || up 2
+echo "$(($(date +%s) - start))" >"$out/up.seconds"
+[[ "$(jq -r '.outcome // empty' "$out/up.json" 2>/dev/null | tail -1)" == success ]] || finish up-failed
+
+# 4. exec the config script unchanged; forward host sign-in if exported
+fwd=()
+for v in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY; do
+  [[ -n "${!v:-}" ]] && fwd+=(--remote-env "$v=${!v}")
+done
+"${dc[@]}" exec --workspace-folder "$ws" --docker-path podman "${fwd[@]}" \
+  bash /workspace/.skogai-run.sh >"$out/reply.json" 2>"$out/exec.log"
+rc=$?
+
+if ! jq -e . "$out/reply.json" >/dev/null 2>&1; then finish "exec-failed rc=$rc"; fi
+if [[ "$(jq -r '.is_error' "$out/reply.json")" == true ]]; then finish claude-error; fi
+finish ok
