@@ -1,0 +1,12 @@
+{
+  "session_id": "agent_57c6d12f",
+  "task_id": "i-ll-act-as-the-orchestrator-and-use-what-already",
+  "agent_type": "general",
+  "backend": "claude",
+  "started": "2026-09-27T06:05:43.648527+00:00",
+  "status": "failed",
+  "tmux_session": null,
+  "output_file": "/mnt/sda1/claude-container-example/ansible-claude-code-devcontainer/state/sessions/agent_57c6d12f.output",
+  "error": "Timeout after 10s",
+  "completed_at": null
+}

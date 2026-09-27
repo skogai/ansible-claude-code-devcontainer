@@ -1,0 +1,20 @@
+**The base case works end to end but can't sign in. The container builds and starts, then Claude in the container stops with `Not logged in · Please run /login` and uses 0 tokens.** Step 1 of 2 is done: the runner, base config and notes exist, and the first build has run. Step 2 is sign-in, then the first real comparison of configs.
+
+**Base-case result**
+Run `tmp/runs/20260927T080345-base` finished with status `claude-error`. The host exports neither `CLAUDE_CODE_OAUTH_TOKEN` nor `ANTHROPIC_API_KEY`. The container's `claude-code-config-*` volume is also empty, so there was no login to use. The failure was recorded like any other result: 0 input, 0 output, $0. `up` itself took 15s because it reused the container that was already running. The first-time setup steps (plugin installs, then the start-up scripts) all ran without errors. `CONTEXT.md` was only 37 bytes because nothing was staged, so `git diff --cached` was empty.
+
+**What rootless podman broke**
+The image built without errors in about 2.5 minutes. Then the first run, `20260927T074745-base`, hung for more than 10 minutes after `Container started`. The devcontainer CLI waits for podman to report that the container started, but it starts listening at the same moment it starts the container. When it starts listening too late, it misses that report and waits forever. I killed that run, and it is recorded as `up-failed`.
+
+**Fix in the runner**
+`.skogai/scripts/run` now has a watchdog. If `up` prints nothing for 60 seconds after `Container started`, the runner kills it and runs `up` once more. The second `up` finds the running container and carries on. **The watchdog has not been tested on a cold start yet**, because the successful run reused a container that was already up.
+
+**Where it lives**
+- The runner, the base config (`.skogai/config/claude/base/run.sh`) and `.skogai/NOTES.md` are committed as `f0cdaab` and pushed.
+- `NOTES.md` holds the podman diagnosis, a results table with both runs, and the next things to try.
+- I left `state/` and `tasks/` alone because they are not mine.
+
+To unblock sign-in, pick one:
+1. Export a token on the host (run `claude setup-token` to get one), then start a run: `CLAUDE_CODE_OAUTH_TOKEN=<token> .skogai/scripts/run base`
+2. Or log in once inside the container, and the volume will keep the login: `DOCKER_HOST=unix:///run/user/1000/podman/podman.sock npx -y @devcontainers/cli exec --workspace-folder tmp/workspace --docker-path podman claude /login`
+EXIT_CODE=0
